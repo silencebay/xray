@@ -1,0 +1,177 @@
+name: Publish Docker Image
+
+on:
+  push:
+    branches: 
+      - main
+  schedule:
+    # * is a special character in YAML so you have to quote this string
+    - cron: "0 0 */3 * *"
+  workflow_dispatch:
+
+jobs:
+  multi:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v1
+        with:
+          platforms: arm64,arm
+
+      - name: Get Xray latest version
+        id: xray_latest_version
+        run: |
+          repo="XTLS/Xray-core"
+          resp=$(curl -s https://api.github.com/repos/$repo/releases/latest)
+          release_url=$(echo $resp | jq -r '.url')
+          tag=$(echo $resp | jq -r '.tag_name')
+          read type tag_sha < <(echo $(curl -s "https://api.github.com/repos/$repo/git/ref/tags/$tag" | 
+              jq -r '.object.type,.object.sha'))
+
+          if [ $type == "commit" ]; then
+              target_commitish=$tag_sha
+          else
+              sha=$(curl -s "https://api.github.com/repos/$repo/git/tags/$tag_sha" | jq '.object.sha')
+              target_commitish=$sha
+          fi
+
+          echo "::set-output name=release_url::${release_url}"
+          echo "::set-output name=tag::${tag}"
+          echo "::set-output name=target_commitish::${target_commitish}"
+
+      - name: Get Xray version
+        id: xray_target_version
+        env:
+          XRAY_VERSION: ${{ secrets.XRAY_VERSION }}
+        run: |
+          repo="XTLS/Xray-core"
+          version=${{ env.XRAY_VERSION }}
+          [ -z "$version" ] && version="latest"
+          if [ "$version" = "latest" ]; then
+            release_url=${{ steps.xray_latest_version.outputs.release_url }}
+            tag=${{ steps.xray_latest_version.outputs.tag }}
+            target_commitish=${{ steps.xray_latest_version.outputs.target_commitish }}
+            echo "::set-output name=release_url::${release_url}"
+            echo "::set-output name=tag::${tag}"
+            echo "::set-output name=target_commitish::${target_commitish}"
+            exit 0
+          fi
+
+          resp=$(curl -s "https://api.github.com/repos/$repo/releases/tags/${version}")
+          release_url=$(echo $resp | jq -r '.url')
+          tag=$(echo $resp | jq -r '.tag_name')
+          read type tag_sha < <(echo $(curl -s "https://api.github.com/repos/$repo/git/ref/tags/$tag" | 
+              jq -r '.object.type,.object.sha'))
+
+          if [ $type == "commit" ]; then
+              target_commitish=$tag_sha
+          else
+              sha=$(curl -s "https://api.github.com/repos/$repo/git/tags/$tag_sha" | jq '.object.sha')
+              target_commitish=$sha
+          fi        
+
+          echo "::set-output name=release_url::${release_url}"
+          echo "::set-output name=tag::${tag}"
+          echo "::set-output name=target_commitish::${target_commitish}"
+
+      - name: Get docker tags
+        id: docker_tags
+        env:
+          REPOSITORIES: ${{ secrets.DOCKERHUB_USERNAME }}/xray,ghcr.io/${{ github.repository }}
+        run: |
+          declare -a images
+          declare -a tags
+          declare -a repositories=($(echo ${{ env.REPOSITORIES }} | tr "," " "))
+          latest_target_commitish=${{ steps.xray_latest_version.outputs.target_commitish }}
+          target_commitish=${{ steps.xray_target_version.outputs.target_commitish }}
+          target_tag=${{ steps.xray_target_version.outputs.tag }}
+          version=${target_tag:1}
+          tags+=("$version")
+          [ "$latest_target_commitish" = "$target_commitish" ] && tags+=('latest')
+
+          for repository in ${repositories[@]}; do
+            for tag in ${tags[@]}; do
+              images+=("${repository}:${tag}")
+            done
+          done
+
+          images_str=$(echo ${images[@]} | tr \  ,)
+          echo "::set-output name=tags::${images_str}"
+
+      - name: Get docker build args
+        id: docker_build_args
+        run: |
+          tag=${{ steps.xray_target_version.outputs.tag }}
+          release_url=${{ steps.xray_target_version.outputs.release_url }}
+          target_commitish=${{ steps.xray_target_version.outputs.target_commitish }}
+
+          echo "::set-output name=xray_version::${tag}"
+          echo "::set-output name=xray_target_commitish::${target_commitish}"
+          echo "::set-output name=xray_release_url::${release_url}"
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v1
+
+      # Setup the Github Actions cache.
+      - name: Cache Docker layers
+        uses: actions/cache@v2
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildxarch-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildxarch-
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v1
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to Github Package
+        uses: docker/login-action@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # the arm64 is of course much slower due to qemu, so build and push amd64 **first**
+      # due to the way manifests work, the gap between this and the complete push below
+      #  could result in pull failures or inconsistencies for arm64, such is life.
+      # further duplicated by building both release and debug builds
+      - name: Build and push amd64 Release Docker Image to DockerHub and Github docker registry
+        uses: docker/build-push-action@v2
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.docker_tags.outputs.tags }}
+          build-args: |
+            XRAY_VERSION=${{ steps.docker_build_args.outputs.xray_version }}
+            XRAY_RELEASE_URL=${{ steps.docker_build_args.outputs.xray_release_url }}
+            XRAY_TARGET_COMMITISH=${{ steps.docker_build_args.outputs.xray_target_commitish }}
+          cache-from: type=local,src=/tmp/.buildx-cache
+          # first run does not export the cache
+
+      # Do it all again with both archs. the amd64 will be a huge cache hit
+      # this will update the manifest have both arches
+      - name: Build and push multiarch Release Docker Image to DockerHub and Github docker registry
+        uses: docker/build-push-action@v2
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          file: ./Dockerfile
+          platforms: linux/arm64,linux/arm/v7,linux/amd64
+          push: true
+          tags: ${{ steps.docker_tags.outputs.tags }}
+          build-args: |
+            XRAY_VERSION=${{ steps.docker_build_args.outputs.xray_version }}
+            XRAY_RELEASE_URL=${{ steps.docker_build_args.outputs.xray_release_url }}
+            XRAY_TARGET_COMMITISH=${{ steps.docker_build_args.outputs.xray_target_commitish }}
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache

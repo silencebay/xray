@@ -1,0 +1,16 @@
+version: "3.7"
+
+services:
+  naiveproxy:
+    image: ghcr.io/silencebay/xray:latest
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      - "PREFER_IPV4=true"
+    volumes:
+      - ./config.json:/etc/xray/config.json:ro
+      - ./cert:/cert
+    network_mode: host
+    restart: always
